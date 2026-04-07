@@ -6,7 +6,7 @@ Detects text regions and returns bounding boxes for black-box masking.
 import cv2
 import numpy as np
 import os
-
+import torch
 try:
     import onnxruntime as ort
     HAS_ORT = True
@@ -28,18 +28,18 @@ class DBNetTextDetector:
         self.ready = False
 
         # Detection parameters
-        self.conf_threshold = 0.2       # Binary threshold for probability map
-        self.box_threshold = 0.3        # Min score to keep a box
-        self.min_area = 50              # Min pixel area to keep a text region
-        self.max_side = 640             # Max input dimension (speed vs accuracy)
+        self.conf_threshold = 0.25      # Binary threshold for probability map
+        self.box_threshold = 0.35       # Min score to keep a box
+        self.min_area = 80              # Min pixel area to keep a text region
+        self.max_side = 416             # Max input dimension (speed vs accuracy)
         self.unclip_ratio = 1.6         # Expand detected polygons slightly
 
         # Caching
         self.cached_text_boxes = []
         self.text_frame_count = 0
-        self.text_detection_interval = 8  # Run every N frames (text is static)
+        self.text_detection_interval = 2  # Run every N frames (text is static)
         self.text_persistence = 0
-        self.max_text_persistence = 20    # Keep text boxes for 20 frames
+        self.max_text_persistence = 8    # Keep text boxes for 25 frames
 
         if not HAS_ORT:
             print("onnxruntime not available – text detection disabled")
@@ -52,32 +52,38 @@ class DBNetTextDetector:
         self._load_model(model_path, use_gpu)
 
     def _load_model(self, model_path, use_gpu):
-        """Load ONNX model with GPU or CPU provider."""
+        """Load ONNX model with explicit CUDA 11.8 settings."""
         try:
-            providers = []
-            if use_gpu:
-                # Try CUDA first, then DirectML, then CPU
-                available = ort.get_available_providers()
-                if "CUDAExecutionProvider" in available:
-                    providers.append("CUDAExecutionProvider")
-                if "DmlExecutionProvider" in available:
-                    providers.append("DmlExecutionProvider")
-            providers.append("CPUExecutionProvider")
-
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            # Keep it lightweight – single thread for text detection
-            sess_options.intra_op_num_threads = 2
+            sess_options.intra_op_num_threads = 4
+
+            if use_gpu:
+                # Force CUDA provider first with explicit settings for CUDA 11.8
+                providers = [
+                    ('CUDAExecutionProvider', {
+                        'device_id': 0,
+                        'arena_extend_strategy': 'kNextPowerOfTwo',
+                        'gpu_mem_limit': 2 * 1024 * 1024 * 1024,  # 2 GB - safe for 3050 Ti
+                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                    }),
+                    'CPUExecutionProvider'
+                ]
+            else:
+                providers = ['CPUExecutionProvider']
 
             self.session = ort.InferenceSession(
-                model_path, sess_options=sess_options, providers=providers
+                model_path, 
+                sess_options=sess_options, 
+                providers=providers
             )
+
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
             self.ready = True
 
             active_provider = self.session.get_providers()[0]
-            print(f"DBNet text detector loaded on {active_provider}  "
+            print(f"DBNet text detector loaded on {active_provider} "
                   f"(model: {os.path.basename(model_path)}, "
                   f"{os.path.getsize(model_path) / 1e6:.1f} MB)")
 
@@ -133,13 +139,18 @@ class DBNetTextDetector:
     # ------------------------------------------------------------------ #
     def _postprocess(self, prob_map, ratio_h, ratio_w, orig_h, orig_w):
         """
-        Convert probability map → list of (x, y, w, h) bounding boxes.
+        Fast version: morphology + boundingRect only.
+        No minAreaRect, no unclip, no boxPoints → 3-4x faster.
         """
-        # prob_map shape: (1, 1, H, W)
         pred = prob_map[0, 0]
 
-        # Binary threshold
+        # Binary map
         binary = (pred > self.conf_threshold).astype(np.uint8) * 255
+
+        # Light morphology to remove noise and merge nearby letters (huge speed win)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
         # Find contours
         contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -150,46 +161,26 @@ class DBNetTextDetector:
             if area < self.min_area:
                 continue
 
-            # Score: mean probability inside the contour
+            # Quick score (mean probability)
             mask = np.zeros_like(pred, dtype=np.uint8)
             cv2.fillPoly(mask, [contour], 1)
             score = cv2.mean(pred, mask)[0]
             if score < self.box_threshold:
                 continue
 
-            # Get bounding rect and unclip (expand slightly)
-            rect = cv2.minAreaRect(contour)
-            box_points = cv2.boxPoints(rect)
+            # SIMPLE & FAST bounding rect (perfect for black-box)
+            x, y, w, h = cv2.boundingRect(contour)
 
-            # Unclip: expand the polygon
-            box_points = self._unclip(box_points, self.unclip_ratio)
+            # Scale back to original resolution
+            x = max(0, int(x * ratio_w))
+            y = max(0, int(y * ratio_h))
+            w = min(orig_w - x, int(w * ratio_w))
+            h = min(orig_h - y, int(h * ratio_h))
 
-            # Get axis-aligned bounding box
-            x_coords = box_points[:, 0] * ratio_w
-            y_coords = box_points[:, 1] * ratio_h
-
-            x_min = max(0, int(np.min(x_coords)))
-            y_min = max(0, int(np.min(y_coords)))
-            x_max = min(orig_w, int(np.max(x_coords)))
-            y_max = min(orig_h, int(np.max(y_coords)))
-
-            w = x_max - x_min
-            h = y_max - y_min
-
-            if w > 5 and h > 3:  # Filter tiny noise
-                boxes.append((x_min, y_min, w, h))
+            if w > 8 and h > 6:   # slightly larger filter
+                boxes.append((x, y, w, h))
 
         return boxes
-
-    def _unclip(self, box_points, ratio):
-        """Expand a rotated rect's box points by ratio (Vatti clipping approx)."""
-        # Simple expansion: scale from center
-        cx = np.mean(box_points[:, 0])
-        cy = np.mean(box_points[:, 1])
-        expanded = box_points.copy()
-        expanded[:, 0] = cx + (box_points[:, 0] - cx) * ratio
-        expanded[:, 1] = cy + (box_points[:, 1] - cy) * ratio
-        return expanded
 
     # ------------------------------------------------------------------ #
     #  Public API
