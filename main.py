@@ -1,8 +1,8 @@
 """
-Privacy-Blurring Camera - Main Application  (Review 2)
+Privacy-Blurring Camera - Main Application
 Floating widget with draggable UI and minimize-to-logo functionality.
 
-Review 2 changes:
+Review changes:
   - Frame buffer: rolling N-frame buffer ensures no unblurred frame ever
     reaches the display — the pipeline blurs a frame before rendering it.
   - Camera selector: dropdown lets the user switch between /dev/video0..3
@@ -18,8 +18,8 @@ Review 2 changes:
 """
 
 import sys
-# Import onnxruntime early — before PyQt6 modifies DLL search paths
 try:
+    import torch   
     import onnxruntime
 except ImportError:
     pass
@@ -28,10 +28,10 @@ from collections import deque
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QComboBox,
-)
-from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, pyqtSlot, QRectF
+    QPushButtonFrame, QComboBox,
+), QPoint, QThread, pyqtSignal, pyqtS, QLabel, Qlot, QRectF
 from PyQt6.QtGui import (
+from PyQt6.QtCore import Qt
     QIcon, QPixmap, QPainter, QColor, QPainterPath,
     QFont, QFontDatabase, QImage,
 )
@@ -464,7 +464,7 @@ class FloatingWidget(QWidget):
             self.update_status("Loading Text AI…", "#e5c07b")
             self.text_detector = DBNetTextDetector(
                 model_path="models/dbnet_en.onnx",
-                use_gpu=False,
+                use_gpu=True,
             )
             if self.text_detector.ready:
                 self.update_status("Privacy AI Ready", "#98c379")
