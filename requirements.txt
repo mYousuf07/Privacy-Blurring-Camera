@@ -11,4 +11,4 @@ torchvision>=0.15.0
 ultralytics>=8.0.0
 
 # Use GPU-enabled ONNX Runtime (also works on CPU, but requires CUDA libs present)
-onnxruntime-gpu>=1.15.0
+onnxruntime-gpu[cuda,cudnn]
